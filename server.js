@@ -1,40 +1,72 @@
+/**
+ * rtk-openai-realtime-proxy - server.js
+ *
+ * Endpoints:
+ *   HTTP  GET  /health   -> "ok"
+ *   WS    WSS  /realtime -> proxy to OpenAI Realtime WS
+ *
+ * Required env:
+ *   OPENAI_API_KEY        = "sk-..."
+ *
+ * Optional env:
+ *   OPENAI_REALTIME_URL   = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+ *   PORT                  = (Render provides)
+ */
+
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = parseInt(process.env.PORT || "10000", 10);
 
-// Render 上用環境變數設定（不要把 key 寫死在 repo）
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_REALTIME_URL =
-  process.env.OPENAI_REALTIME_URL ||
-  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+  (process.env.OPENAI_REALTIME_URL || "").trim() ||
+  "wss://api.openai.com/v1/realtime?model=gpt-realtime";
 
 if (!OPENAI_API_KEY) {
-  console.error("Missing env OPENAI_API_KEY");
+  console.error("[FATAL] Missing env OPENAI_API_KEY");
   process.exit(1);
 }
 
+function now() {
+  return new Date().toISOString();
+}
+
+function log(...args) {
+  console.log(now(), ...args);
+}
+
+function err(...args) {
+  console.error(now(), ...args);
+}
+
+function safeClose(ws, code, reason) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close(code, reason);
+  } catch {}
+}
+
+function safeTerminate(ws) {
+  try {
+    ws.terminate();
+  } catch {}
+}
+
 const server = http.createServer((req, res) => {
-  // 健康檢查：Render / 或你自己用來喚醒 free service
-  if (req.url === "/" || req.url === "/health") {
+  const url = req.url || "/";
+  if (url === "/" || url === "/health") {
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
     res.end("ok");
     return;
   }
-
   res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
   res.end("not found");
 });
 
-// WebSocket Server（noServer 模式，接管 upgrade）
+// Use noServer to handle WS upgrade manually
 const wss = new WebSocketServer({ noServer: true });
 
-function safeClose(ws, code, reason) {
-  try { ws.close(code, reason); } catch {}
-}
-
 server.on("upgrade", (req, socket, head) => {
-  // 只允許 /realtime 這個 WS path
   const url = req.url || "";
   if (!url.startsWith("/realtime")) {
     socket.destroy();
@@ -47,67 +79,97 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 wss.on("connection", (clientWs, req) => {
-  console.log("Client WS connected:", req.url);
+  const path = req.url || "/realtime";
+  log("[Client] WS connected:", path);
 
-  // 連到 OpenAI 官方 Realtime（這裡補 Bearer）
+  // Connect upstream to OpenAI Realtime WS
   const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-      // OpenAI 是否需要額外 beta header 以官方文件為準；
-      // 若你測到需要，可加： "OpenAI-Beta": "realtime=v1"
-    }
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      // Important for Realtime beta compatibility
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
+
+  // When OpenAI handshake fails, ws emits "unexpected-response"
+  openaiWs.on("unexpected-response", (_req, res) => {
+    err(
+      "[OpenAI] unexpected-response:",
+      res.statusCode,
+      res.statusMessage || ""
+    );
+    // Close client with 1011 (internal error)
+    safeClose(clientWs, 1011, `openai unexpected-response ${res.statusCode}`);
+    // Ensure upstream terminates too
+    safeTerminate(openaiWs);
   });
 
   const closeBoth = (code = 1000, reason = "closing") => {
     safeClose(clientWs, code, reason);
     safeClose(openaiWs, code, reason);
+    // In case close doesn't happen, terminate
+    setTimeout(() => {
+      safeTerminate(clientWs);
+      safeTerminate(openaiWs);
+    }, 1500);
   };
 
-  // 雙向轉發（binary/text 原封不動）
+  openaiWs.on("open", () => {
+    log("[OpenAI] Connected to OpenAI Realtime");
+  });
+
   openaiWs.on("message", (data, isBinary) => {
+    // Upstream -> Client
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(data, { binary: isBinary });
     }
   });
 
   clientWs.on("message", (data, isBinary) => {
+    // Client -> Upstream
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(data, { binary: isBinary });
     }
   });
 
-  openaiWs.on("open", () => console.log("Connected to OpenAI Realtime"));
   openaiWs.on("close", (code, reason) => {
-    console.log("OpenAI WS closed:", code, reason?.toString());
+    log("[OpenAI] WS closed:", code, reason?.toString() || "");
     closeBoth(1000, "openai closed");
   });
-  openaiWs.on("error", (err) => {
-    console.error("OpenAI WS error:", err?.message || err);
+
+  openaiWs.on("error", (e) => {
+    // Common: "Unexpected server response: 401"
+    err("[OpenAI] WS error:", e?.message || e);
     closeBoth(1011, "openai error");
   });
 
   clientWs.on("close", (code, reason) => {
-    console.log("Client WS closed:", code, reason?.toString());
+    log("[Client] WS closed:", code, reason?.toString() || "");
     closeBoth(1000, "client closed");
   });
-  clientWs.on("error", (err) => {
-    console.error("Client WS error:", err?.message || err);
+
+  clientWs.on("error", (e) => {
+    err("[Client] WS error:", e?.message || e);
     closeBoth(1011, "client error");
   });
 
-  // 可選：每 20 秒 ping，避免某些中間層 idle timeout（不保證能防 Render free spin down）
+  // Ping to keep intermediate proxies alive (does not prevent Render free spin-down)
   const pingTimer = setInterval(() => {
     try {
       if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
+    } catch {}
+    try {
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.ping();
     } catch {}
   }, 20000);
 
-  clientWs.on("close", () => clearInterval(pingTimer));
-  openaiWs.on("close", () => clearInterval(pingTimer));
+  const clear = () => clearInterval(pingTimer);
+  clientWs.on("close", clear);
+  openaiWs.on("close", clear);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Listening on :${PORT}`);
-  console.log(`WS endpoint: ws://localhost:${PORT}/realtime`);
+  log("Listening on :" + PORT);
+  log("WS endpoint: ws://localhost:" + PORT + "/realtime");
+  log("Upstream OPENAI_REALTIME_URL:", OPENAI_REALTIME_URL);
 });
