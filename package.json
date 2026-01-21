@@ -1,0 +1,13 @@
+{
+  "name": "rtk-openai-realtime-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
