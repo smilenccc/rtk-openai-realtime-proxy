@@ -92,14 +92,15 @@ async function readJsonBody(req, maxBytes = 256 * 1024) {
       chunks.push(chunk);
     });
     req.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf-8").trim();
-      if (!raw) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch (e) {
-        reject(new Error("invalid json"));
-      }
-    });
+	  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+	  if (!raw) return resolve({});
+	  try {
+		resolve(JSON.parse(raw));
+	  } catch (e) {
+		console.error(now(), "[HTTP] invalid json raw=", raw.slice(0, 200));
+		reject(new Error("invalid json"));
+	  }
+	});
     req.on("error", (e) => reject(e));
   });
 }
@@ -370,6 +371,7 @@ wss.on("connection", (clientWs, req) => {
   const pingTimer = setInterval(() => {
     try {
       if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
+	  
     } catch {}
     try {
       if (openaiWs.readyState === WebSocket.OPEN) openaiWs.ping();
