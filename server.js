@@ -1,10 +1,11 @@
 /**
- * rtk-openai-realtime-proxy - server.js
+ * rtk-openai-realtime-proxy - server.js (completed)
  *
  * Endpoints:
- *   HTTP  GET  /health              -> "ok" (plain text, for existing usage)
+ *   HTTP  GET  /health              -> "ok" (plain text)
  *   HTTP  POST /gemini/chat         -> { ok:true, text:"..." }
  *   HTTP  POST /gemini/translate    -> { ok:true, text:"..." }
+ *   HTTP  POST /gemini/semantics    -> { ok:true, intent, slots, confidence, brief, raw }
  *   WS    WSS  /realtime            -> proxy to OpenAI Realtime WS
  *
  * Required env:
@@ -33,35 +34,25 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || "v1beta").trim();
 const GEMINI_API_BASE = `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}`;
 
-// OpenAI key only required for WS /realtime.
-// We allow server to start even if missing, but WS will fail if used.
-if (!OPENAI_API_KEY) {
-  console.warn("[WARN] Missing env OPENAI_API_KEY (WS /realtime will not work)");
+// ===== Helpers =====
+function now() { return new Date().toISOString(); }
+function log(...args) { console.log(now(), ...args); }
+function err(...args) { console.error(now(), ...args); }
+
+function safeKeySuffix(k) {
+  if (!k) return "(missing)";
+  return "****" + k.slice(-4);
 }
 
-function now() {
-  return new Date().toISOString();
-}
-function log(...args) {
-  console.log(now(), ...args);
-}
-function err(...args) {
-  console.error(now(), ...args);
-}
-
-function safeClose(ws, code, reason) {
-  try {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close(code, reason);
-  } catch {}
-}
-function safeTerminate(ws) {
-  try {
-    ws.terminate();
-  } catch {}
+function setCors(res) {
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
+  res.setHeader("access-control-allow-headers", "content-type,x-request-id");
 }
 
 function sendJson(res, statusCode, obj) {
   const body = JSON.stringify(obj);
+  setCors(res);
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -70,6 +61,7 @@ function sendJson(res, statusCode, obj) {
 }
 
 function sendText(res, statusCode, text) {
+  setCors(res);
   res.writeHead(statusCode, {
     "content-type": "text/plain; charset=utf-8",
     "cache-control": "no-store",
@@ -78,7 +70,6 @@ function sendText(res, statusCode, text) {
 }
 
 async function readJsonBody(req, maxBytes = 256 * 1024) {
-  // Minimal JSON parser for plain http server
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -92,15 +83,15 @@ async function readJsonBody(req, maxBytes = 256 * 1024) {
       chunks.push(chunk);
     });
     req.on("end", () => {
-	  const raw = Buffer.concat(chunks).toString("utf-8").trim();
-	  if (!raw) return resolve({});
-	  try {
-		resolve(JSON.parse(raw));
-	  } catch (e) {
-		console.error(now(), "[HTTP] invalid json raw=", raw.slice(0, 200));
-		reject(new Error("invalid json"));
-	  }
-	});
+      const raw = Buffer.concat(chunks).toString("utf-8").trim();
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch (e) {
+        err("[HTTP] invalid json raw(head)=", raw.slice(0, 200));
+        reject(new Error("invalid json"));
+      }
+    });
     req.on("error", (e) => reject(e));
   });
 }
@@ -117,7 +108,40 @@ function extractGeminiText(json) {
   }
 }
 
+function extractFirstJsonObject(input) {
+  const s = String(input || "").trim();
+  if (!s) return null;
+
+  let started = false, depth = 0, inString = false, escape = false, startIdx = -1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!started) {
+      if (c === "{") { started = true; startIdx = i; depth = 1; }
+      continue;
+    }
+    if (inString) {
+      if (escape) escape = false;
+      else if (c === "\\") escape = true;
+      else if (c === "\"") inString = false;
+      continue;
+    } else {
+      if (c === "\"") inString = true;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0 && startIdx >= 0) return s.substring(startIdx, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
 async function geminiGenerateContent({ model, text, system, generationConfig }) {
+  if (!globalThis.fetch) {
+    const e = new Error("Node fetch not available. Please use Node 18+.");
+    e.statusCode = 500;
+    throw e;
+  }
   if (!GEMINI_API_KEY) {
     const e = new Error("Missing env GEMINI_API_KEY");
     e.statusCode = 500;
@@ -138,21 +162,13 @@ async function geminiGenerateContent({ model, text, system, generationConfig }) 
 
   const payload = {
     contents: [
-      {
-        role: "user",
-        parts: [{ text }],
-      },
+      { role: "user", parts: [{ text }] },
     ],
   };
 
-  // System instruction (optional)
   if (system && typeof system === "string" && system.trim()) {
-    payload.systemInstruction = {
-      parts: [{ text: system.trim() }],
-    };
+    payload.systemInstruction = { parts: [{ text: system.trim() }] };
   }
-
-  // generationConfig (optional)
   if (generationConfig && typeof generationConfig === "object") {
     payload.generationConfig = generationConfig;
   }
@@ -161,19 +177,15 @@ async function geminiGenerateContent({ model, text, system, generationConfig }) 
     method: "POST",
     headers: {
       "content-type": "application/json",
-      // IMPORTANT: put key in header to avoid logging/leaking via URL
+      // Key in header (avoid leaking in URL)
       "x-goog-api-key": GEMINI_API_KEY,
     },
     body: JSON.stringify(payload),
   });
 
   const raw = await resp.text();
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    json = null;
-  }
+  let json = null;
+  try { json = JSON.parse(raw); } catch { /* ignore */ }
 
   if (!resp.ok) {
     const e = new Error(`Gemini HTTP ${resp.status}`);
@@ -183,11 +195,7 @@ async function geminiGenerateContent({ model, text, system, generationConfig }) 
     throw e;
   }
 
-  const outText = extractGeminiText(json);
-  return {
-    text: outText || "",
-    rawJson: json,
-  };
+  return { text: extractGeminiText(json), rawJson: json };
 }
 
 // =====================
@@ -197,14 +205,21 @@ const server = http.createServer(async (req, res) => {
   const method = (req.method || "GET").toUpperCase();
   const url = req.url || "/";
 
-  // Existing health endpoint
+  // CORS preflight
+  if (method === "OPTIONS") {
+    setCors(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Health
   if (method === "GET" && (url === "/" || url === "/health")) {
-    // keep plain text "ok" for your existing Android test
     sendText(res, 200, "ok");
     return;
   }
 
-  // Gemini: chat
+  // Gemini: chat (raw proxy)
   if (method === "POST" && url === "/gemini/chat") {
     try {
       const body = await readJsonBody(req);
@@ -214,19 +229,11 @@ const server = http.createServer(async (req, res) => {
       const system = body.system || "";
       const generationConfig = body.generationConfig || { maxOutputTokens: 256 };
 
-      log("[Gemini] /gemini/chat model=", model, "textLen=", String(text).length);
+      log(`[Gemini] /gemini/chat model=${model} textLen=${String(text).length} key=${safeKeySuffix(GEMINI_API_KEY)}`);
 
-      const r = await geminiGenerateContent({
-        model,
-        text,
-        system,
-        generationConfig,
-      });
+      const r = await geminiGenerateContent({ model, text, system, generationConfig });
 
-      sendJson(res, 200, {
-        ok: true,
-        text: r.text,
-      });
+      sendJson(res, 200, { ok: true, text: r.text });
     } catch (e) {
       err("[Gemini] /gemini/chat error:", e?.message || e);
       sendJson(res, e.statusCode || 500, {
@@ -250,7 +257,7 @@ const server = http.createServer(async (req, res) => {
 
       const prompt = `請把以下文字翻譯成 ${targetLang}，只輸出翻譯結果，不要任何多餘說明：\n\n${text}`;
 
-      log("[Gemini] /gemini/translate model=", model, "target=", targetLang, "textLen=", String(text).length);
+      log(`[Gemini] /gemini/translate model=${model} target=${targetLang} textLen=${String(text).length} key=${safeKeySuffix(GEMINI_API_KEY)}`);
 
       const r = await geminiGenerateContent({
         model,
@@ -259,10 +266,7 @@ const server = http.createServer(async (req, res) => {
         generationConfig: { maxOutputTokens: 256 },
       });
 
-      sendJson(res, 200, {
-        ok: true,
-        text: r.text,
-      });
+      sendJson(res, 200, { ok: true, text: r.text });
     } catch (e) {
       err("[Gemini] /gemini/translate error:", e?.message || e);
       sendJson(res, e.statusCode || 500, {
@@ -275,16 +279,93 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Not found
+  // Gemini: semantics (recommended for stability)
+  // body: { model?, text, maxOutputTokens? }
+  // resp: { ok:true, intent, slots, confidence, brief, raw }
+  if (method === "POST" && url === "/gemini/semantics") {
+    try {
+      const body = await readJsonBody(req);
+
+      const model = body.model || "gemini-2.5-flash-lite";
+      const userText = String(body.text || "").trim();
+      const maxOutputTokens = Number(body.maxOutputTokens || 256);
+
+      if (!userText) {
+        sendJson(res, 400, { ok: false, error: "Missing text" });
+        return;
+      }
+
+      const system = `
+你是一個嚴格的 JSON 產生器。
+請只輸出一個「可被 JSON.parse 直接解析」的 JSON 物件，不要有任何多餘文字、不要 markdown。
+JSON 欄位規格：
+- intent: string (小寫)
+- slots: object
+- confidence: number 0~1
+- brief: string (<=20字，繁中)
+`.trim();
+
+      const prompt = `
+使用者語句如下：
+${userText}
+
+請推斷 intent（例如：music_play, music_stop, open_navigation, calendar_query, calendar_add）。
+slots 範例：
+- open_navigation: {"destination":"台中車站"}
+- calendar_add: {"title":"...","date":"YYYY-MM-DD","time":"HH:mm"}
+`.trim();
+
+      log(`[Gemini] /gemini/semantics model=${model} textLen=${userText.length} key=${safeKeySuffix(GEMINI_API_KEY)}`);
+
+      const r = await geminiGenerateContent({
+        model,
+        text: prompt,
+        system,
+        generationConfig: { maxOutputTokens },
+      });
+
+      const rawText = r.text || "";
+      const jsonText = extractFirstJsonObject(rawText) || rawText.trim();
+      let parsed = null;
+      try { parsed = JSON.parse(jsonText); } catch { /* ignore */ }
+
+      if (!parsed || typeof parsed !== "object") {
+        sendJson(res, 200, { ok: true, intent: "unknown", slots: {}, confidence: 0, brief: "parse_error", raw: rawText });
+        return;
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        intent: String(parsed.intent || "unknown").trim().toLowerCase(),
+        slots: parsed.slots && typeof parsed.slots === "object" ? parsed.slots : {},
+        confidence: Number(parsed.confidence || 0),
+        brief: String(parsed.brief || ""),
+        raw: rawText,
+      });
+    } catch (e) {
+      err("[Gemini] /gemini/semantics error:", e?.message || e);
+      sendJson(res, e.statusCode || 500, {
+        ok: false,
+        error: e?.message || "error",
+        upstreamStatus: e.upstreamStatus,
+        upstreamBody: e.upstreamBody,
+      });
+    }
+    return;
+  }
+
   sendText(res, 404, "not found");
 });
 
 // =====================
 // WS Server (OpenAI Realtime proxy)
 // =====================
-
-// Use noServer to handle WS upgrade manually
 const wss = new WebSocketServer({ noServer: true });
+
+function safeClose(ws, code, reason) {
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(code, reason); } catch {}
+}
+function safeTerminate(ws) { try { ws.terminate(); } catch {} }
 
 server.on("upgrade", (req, socket, head) => {
   const url = req.url || "";
@@ -292,7 +373,6 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-
   wss.handleUpgrade(req, socket, head, (clientWs) => {
     wss.emit("connection", clientWs, req);
   });
@@ -308,7 +388,6 @@ wss.on("connection", (clientWs, req) => {
     return;
   }
 
-  // Connect upstream to OpenAI Realtime WS
   const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -331,27 +410,18 @@ wss.on("connection", (clientWs, req) => {
     }, 1500);
   };
 
-  openaiWs.on("open", () => {
-    log("[OpenAI] Connected to OpenAI Realtime");
-  });
-
+  openaiWs.on("open", () => log("[OpenAI] Connected to OpenAI Realtime"));
   openaiWs.on("message", (data, isBinary) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data, { binary: isBinary });
-    }
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
   });
-
   clientWs.on("message", (data, isBinary) => {
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(data, { binary: isBinary });
-    }
+    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(data, { binary: isBinary });
   });
 
   openaiWs.on("close", (code, reason) => {
     log("[OpenAI] WS closed:", code, reason?.toString() || "");
     closeBoth(1000, "openai closed");
   });
-
   openaiWs.on("error", (e) => {
     err("[OpenAI] WS error:", e?.message || e);
     closeBoth(1011, "openai error");
@@ -361,21 +431,14 @@ wss.on("connection", (clientWs, req) => {
     log("[Client] WS closed:", code, reason?.toString() || "");
     closeBoth(1000, "client closed");
   });
-
   clientWs.on("error", (e) => {
     err("[Client] WS error:", e?.message || e);
     closeBoth(1011, "client error");
   });
 
-  // Ping to keep intermediate proxies alive (does not prevent Render free spin-down)
   const pingTimer = setInterval(() => {
-    try {
-      if (clientWs.readyState === WebSocket.OPEN) clientWs.ping();
-	  
-    } catch {}
-    try {
-      if (openaiWs.readyState === WebSocket.OPEN) openaiWs.ping();
-    } catch {}
+    try { if (clientWs.readyState === WebSocket.OPEN) clientWs.ping(); } catch {}
+    try { if (openaiWs.readyState === WebSocket.OPEN) openaiWs.ping(); } catch {}
   }, 20000);
 
   const clear = () => clearInterval(pingTimer);
@@ -387,6 +450,6 @@ server.listen(PORT, "0.0.0.0", () => {
   log("Listening on :" + PORT);
   log("WS endpoint: ws://localhost:" + PORT + "/realtime");
   log("Upstream OPENAI_REALTIME_URL:", OPENAI_REALTIME_URL);
-  log("Gemini HTTP enabled:", GEMINI_API_KEY ? "YES" : "NO (missing GEMINI_API_KEY)");
+  log("Gemini HTTP enabled:", GEMINI_API_KEY ? "YES key=" + safeKeySuffix(GEMINI_API_KEY) : "NO (missing GEMINI_API_KEY)");
   log("Gemini base:", GEMINI_API_BASE);
 });
