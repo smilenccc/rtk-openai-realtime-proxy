@@ -6,6 +6,7 @@
  *   HTTP  POST /gemini/chat         -> { ok:true, text:"..." }
  *   HTTP  POST /gemini/translate    -> { ok:true, text:"..." }
  *   HTTP  POST /gemini/semantics    -> { ok:true, intent, slots, confidence, brief, raw }
+ *   HTTP  POST /openai/chat         -> { ok:true, text:"..." }
  *   WS    WSS  /realtime            -> proxy to OpenAI Realtime WS
  *
  * Required env:
@@ -344,6 +345,74 @@ slots 範例：
       });
     } catch (e) {
       err("[Gemini] /gemini/semantics error:", e?.message || e);
+      sendJson(res, e.statusCode || 500, {
+        ok: false,
+        error: e?.message || "error",
+        upstreamStatus: e.upstreamStatus,
+        upstreamBody: e.upstreamBody,
+      });
+    }
+    return;
+  }
+
+  // OpenAI: chat (same interface as /gemini/chat)
+  // body: { model?, text, system? }
+  // resp: { ok:true, text:"..." }
+  if (method === "POST" && url === "/openai/chat") {
+    try {
+      if (!OPENAI_API_KEY) {
+        const e = new Error("Missing env OPENAI_API_KEY");
+        e.statusCode = 500;
+        throw e;
+      }
+
+      const body = await readJsonBody(req);
+
+      const model = body.model || "gpt-4o-mini";
+      const text = String(body.text || "").trim();
+      const system = String(body.system || "").trim();
+
+      if (!text) {
+        sendJson(res, 400, { ok: false, error: "Missing text" });
+        return;
+      }
+
+      log(`[OpenAI] /openai/chat model=${model} textLen=${text.length} key=${safeKeySuffix(OPENAI_API_KEY)}`);
+
+      const messages = [];
+      if (system) messages.push({ role: "system", content: system });
+      messages.push({ role: "user", content: text });
+
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "authorization": `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: 1024,
+        }),
+      });
+
+      const raw = await resp.text();
+      let json = null;
+      try { json = JSON.parse(raw); } catch { /* ignore */ }
+
+      if (!resp.ok) {
+        const errMsg = json?.error?.message || raw?.slice(0, 500) || `HTTP ${resp.status}`;
+        const e = new Error(`OpenAI HTTP ${resp.status}: ${errMsg}`);
+        e.statusCode = 502;
+        e.upstreamStatus = resp.status;
+        e.upstreamBody = raw?.slice(0, 2000) || "";
+        throw e;
+      }
+
+      const content = json?.choices?.[0]?.message?.content?.trim() || "";
+      sendJson(res, 200, { ok: true, text: content });
+    } catch (e) {
+      err("[OpenAI] /openai/chat error:", e?.message || e);
       sendJson(res, e.statusCode || 500, {
         ok: false,
         error: e?.message || "error",
