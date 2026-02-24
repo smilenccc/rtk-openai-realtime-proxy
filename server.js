@@ -7,6 +7,7 @@
  *   HTTP  POST /gemini/translate    -> { ok:true, text:"..." }
  *   HTTP  POST /gemini/semantics    -> { ok:true, intent, slots, confidence, brief, raw }
  *   HTTP  POST /openai/chat         -> { ok:true, text:"..." }
+ *   HTTP  POST /whisper/transcribe  -> { ok:true, text:"..." }
  *   WS    WSS  /realtime            -> proxy to OpenAI Realtime WS
  *
  * Required env:
@@ -413,6 +414,99 @@ slots 範例：
       sendJson(res, 200, { ok: true, text: content });
     } catch (e) {
       err("[OpenAI] /openai/chat error:", e?.message || e);
+      sendJson(res, e.statusCode || 500, {
+        ok: false,
+        error: e?.message || "error",
+        upstreamStatus: e.upstreamStatus,
+        upstreamBody: e.upstreamBody,
+      });
+    }
+    return;
+  }
+
+  // Whisper: transcribe audio (base64 WAV → OpenAI Whisper API)
+  // body: { audio: "<base64 WAV>", language?: "zh" }
+  // resp: { ok:true, text:"..." }
+  if (method === "POST" && url === "/whisper/transcribe") {
+    try {
+      if (!OPENAI_API_KEY) {
+        const e = new Error("Missing env OPENAI_API_KEY");
+        e.statusCode = 500;
+        throw e;
+      }
+
+      // Allow up to 10MB for audio payloads
+      const body = await readJsonBody(req, 10 * 1024 * 1024);
+
+      const audioBase64 = String(body.audio || "").trim();
+      const language = String(body.language || "zh").trim();
+
+      if (!audioBase64) {
+        sendJson(res, 400, { ok: false, error: "Missing audio (base64)" });
+        return;
+      }
+
+      log(`[Whisper] /whisper/transcribe audioLen=${audioBase64.length} lang=${language} key=${safeKeySuffix(OPENAI_API_KEY)}`);
+
+      const audioBuffer = Buffer.from(audioBase64, "base64");
+
+      // Build multipart/form-data manually
+      const boundary = "----WhisperBoundary" + Date.now();
+      const parts = [];
+
+      // file part
+      parts.push(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n` +
+        `Content-Type: audio/wav\r\n\r\n`
+      );
+      parts.push(audioBuffer);
+      parts.push("\r\n");
+
+      // model part
+      parts.push(
+        `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`
+      );
+
+      // language part
+      parts.push(
+        `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${language}\r\n`
+      );
+
+      // close
+      parts.push(`--${boundary}--\r\n`);
+
+      const multipartBody = Buffer.concat(
+        parts.map((p) => (typeof p === "string" ? Buffer.from(p, "utf-8") : p))
+      );
+
+      const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${OPENAI_API_KEY}`,
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body: multipartBody,
+      });
+
+      const raw = await resp.text();
+      let json = null;
+      try { json = JSON.parse(raw); } catch { /* ignore */ }
+
+      if (!resp.ok) {
+        const errMsg = json?.error?.message || raw?.slice(0, 500) || `HTTP ${resp.status}`;
+        const e = new Error(`Whisper HTTP ${resp.status}: ${errMsg}`);
+        e.statusCode = 502;
+        e.upstreamStatus = resp.status;
+        e.upstreamBody = raw?.slice(0, 2000) || "";
+        throw e;
+      }
+
+      const text = (json?.text || "").trim();
+      log(`[Whisper] result: "${text.slice(0, 80)}"`);
+      sendJson(res, 200, { ok: true, text });
+    } catch (e) {
+      err("[Whisper] /whisper/transcribe error:", e?.message || e);
       sendJson(res, e.statusCode || 500, {
         ok: false,
         error: e?.message || "error",
